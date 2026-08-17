@@ -1,0 +1,25 @@
+*.o
+*.so
+*.bc
+*.dylib
+*.dll
+results/
+regression.diffs
+regression.out
+tmp_check/
+log/
+
+# Build artifacts
+*.a
+*.pc
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

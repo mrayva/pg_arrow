@@ -1,0 +1,5 @@
+# pg_arrow extension
+comment = 'Serialize PostgreSQL row batches to Apache Arrow IPC format'
+default_version = '1.0'
+module_pathname = '$libdir/pg_arrow'
+relocatable = true
