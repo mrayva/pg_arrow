@@ -136,9 +136,12 @@ output.
 
 ## Performance vs pg_zerialize's msgpack columnar path
 
-Measured server-side (`clock_timestamp()` around 20-50 reps per size) on
-the same NYSE trade fixture used above, comparing `rows_to_arrow`/
-`arrow_to_jsonb` against `rows_to_msgpack_columnar`/`msgpack_to_jsonb`:
+Measured server-side (`clock_timestamp()`, with an untimed warmup call
+before each timed loop, 5-100 reps depending on batch size) on the same
+NYSE trade fixture used above, comparing `rows_to_arrow`/`arrow_to_jsonb`
+against `rows_to_msgpack_columnar`/`msgpack_to_jsonb`.
+
+All 15 columns (mostly `text`):
 
 | Batch | Arrow encode | msgpack encode | Arrow decode | msgpack decode | Arrow size | msgpack size |
 |---|---|---|---|---|---|---|
@@ -146,18 +149,37 @@ the same NYSE trade fixture used above, comparing `rows_to_arrow`/
 | 5,000 rows | 1.36 ms | 0.62 ms | 2.35 ms | 3.86 ms | 645 KB | 418 KB |
 | 50,000 rows | 16.2 ms | 6.35 ms | 26.1 ms | 38.4 ms | 6.41 MB | 4.16 MB |
 
-Consistent pattern across sizes: msgpack encodes ~2.2-2.6x faster (Arrow's
-builder API pays for validity bitmaps, offset buffers, and alignment
-padding per column - overhead that scales with column *count*), but Arrow
-decodes ~1.5x *faster* (typed columnar buffers read back more cheaply than
-msgpack's tag-by-tag parsing), and Arrow's payload runs ~54% larger on this
-fixture, which is unusually string-heavy (14 of 15 columns are `text` -
-close to Arrow's worst case, since every string column carries its own
-offset buffer + validity bitmap on top of the raw bytes; a numeric-heavy
-schema would likely close this gap). Pick msgpack when encode-bound (e.g.
-a hot publish path), Arrow when decode-bound or when the consumer is real
-Arrow-ecosystem tooling (pandas/polars/DuckDB) that would otherwise need a
-conversion step.
+A narrower, more numeric-heavy 5-column projection of the same rows
+(`Exchange`, `Symbol`, `Trade Volume` (int8), `Trade Price` (float8),
+`Sequence Number` (int8)):
+
+| Batch | Arrow encode | msgpack encode | Arrow decode | msgpack decode | Arrow size | msgpack size |
+|---|---|---|---|---|---|---|
+| 100 rows | 0.0093 ms | 0.0039 ms | 0.0224 ms | 0.0337 ms | 4.4 KB | 2.2 KB |
+| 500 rows | 0.028 ms | 0.018 ms | 0.097 ms | 0.160 ms | 18.8 KB | 10.9 KB |
+| 5,000 rows | 0.257 ms | 0.176 ms | 0.973 ms | 1.607 ms | 181 KB | 108 KB |
+| 50,000 rows | 2.55 ms | 1.81 ms | 9.72 ms | 15.76 ms | 1.83 MB | 1.10 MB |
+
+Two patterns hold across both schemas: msgpack encodes faster (Arrow pays
+fixed per-column builder setup - narrowing from 15 to 5 columns shrinks
+that gap from ~2.2-2.6x down to ~1.4-1.6x, since there's proportionally
+less of it to pay), and Arrow decodes ~1.5-1.65x *faster* regardless of
+column count or type (typed columnar buffers read back more cheaply than
+msgpack's tag-by-tag parsing).
+
+Size is the one place the schema comparison overturns the intuitive guess:
+Arrow ran ~54% larger on the wide/text schema, but ~67-72% larger on the
+narrower, more-numeric one - *worse*, not better. Each Arrow column
+carries a fixed validity bitmap + alignment padding regardless of value
+width, and that fixed cost is a larger fraction of an 8-byte int64/float8
+value than of msgpack's compact fixed-width encoding of the same value -
+so narrowing toward numeric columns doesn't shrink Arrow's size overhead
+the way narrowing toward numeric columns might seem like it should.
+
+Pick msgpack when encode-bound (e.g. a hot publish path) or size-sensitive,
+Arrow when decode-bound or when the consumer is real Arrow-ecosystem
+tooling (pandas/polars/DuckDB) that would otherwise need a conversion
+step.
 
 ## Consuming from nats_tool
 
