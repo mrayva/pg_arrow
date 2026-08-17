@@ -206,3 +206,12 @@ grub --format arrow --json`, cross-checked structurally against
 - An `arrow_populate_record`/`arrow_populate_recordset` decode-to-typed-
   composite path (pg_zerialize's `X_populate_record(set)` equivalent) -
   `arrow_to_jsonb` covers verification/inspection for now.
+
+## See Also
+
+- [`pg_zerialize`](https://github.com/mrayva/pg_zerialize): sister
+  extension covering 7 other binary wire formats (msgpack/cbor/zera/
+  flexbuffers/ion/bson/beve) via the zerialize library - richer feature
+  surface (nested composites, `X_populate_record(set)`, JSONB builders)
+  and generally faster to encode, but without Arrow's typed columnar
+  layout or Arrow-ecosystem interop.
