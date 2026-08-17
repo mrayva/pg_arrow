@@ -134,12 +134,53 @@ the identical 100-row batches - 200/200 batches matched exactly, an
 independent confirmation against pg_zerialize's already-verified reference
 output.
 
+## Performance vs pg_zerialize's msgpack columnar path
+
+Measured server-side (`clock_timestamp()` around 20-50 reps per size) on
+the same NYSE trade fixture used above, comparing `rows_to_arrow`/
+`arrow_to_jsonb` against `rows_to_msgpack_columnar`/`msgpack_to_jsonb`:
+
+| Batch | Arrow encode | msgpack encode | Arrow decode | msgpack decode | Arrow size | msgpack size |
+|---|---|---|---|---|---|---|
+| 500 rows | 0.099 ms | 0.056 ms | 0.204 ms | 0.395 ms | 66 KB | 42 KB |
+| 5,000 rows | 1.36 ms | 0.62 ms | 2.35 ms | 3.86 ms | 645 KB | 418 KB |
+| 50,000 rows | 16.2 ms | 6.35 ms | 26.1 ms | 38.4 ms | 6.41 MB | 4.16 MB |
+
+Consistent pattern across sizes: msgpack encodes ~2.2-2.6x faster (Arrow's
+builder API pays for validity bitmaps, offset buffers, and alignment
+padding per column - overhead that scales with column *count*), but Arrow
+decodes ~1.5x *faster* (typed columnar buffers read back more cheaply than
+msgpack's tag-by-tag parsing), and Arrow's payload runs ~54% larger on this
+fixture, which is unusually string-heavy (14 of 15 columns are `text` -
+close to Arrow's worst case, since every string column carries its own
+offset buffer + validity bitmap on top of the raw bytes; a numeric-heavy
+schema would likely close this gap). Pick msgpack when encode-bound (e.g.
+a hot publish path), Arrow when decode-bound or when the consumer is real
+Arrow-ecosystem tooling (pandas/polars/DuckDB) that would otherwise need a
+conversion step.
+
+## Consuming from nats_tool
+
+[nats_asio](https://github.com/mrayva/nats_asio)'s `nats_tool` can decode
+`rows_to_arrow()` output published over NATS directly, the same way it
+already handles pg_zerialize's wire formats:
+
+```sh
+nats_tool grub --topic trades.arrow --json --format arrow
+nats_tool grub --topic trades.arrow --json --format arrow --expand_columnar
+```
+
+Built with `NATS_ASIO_ENABLE_ARROW` (default `ON`, requires `libarrow-dev`
+at build time). Decode-only - there's no `--format arrow` for `pub` mode,
+since `rows_to_arrow()` is a SQL-side batch construct, not something
+buildable from arbitrary JSON input. Verified end-to-end against real rows:
+`rows_to_arrow()` here -> `nats_publish_binary()` (pgnats) -> `nats_tool
+grub --format arrow --json`, cross-checked structurally against
+`msgpack_to_jsonb(rows_to_msgpack_columnar(...))` on the same rows.
+
 ## Not (yet) built
 
 - Nested/composite/array columns.
-- `nats_tool --format arrow` decode support in nats_asio - Arrow isn't a
-  zerialize protocol, so this would need `libarrow` linked into nats_asio
-  directly; a separate, later effort.
 - An `arrow_populate_record`/`arrow_populate_recordset` decode-to-typed-
   composite path (pg_zerialize's `X_populate_record(set)` equivalent) -
   `arrow_to_jsonb` covers verification/inspection for now.
