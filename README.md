@@ -67,29 +67,35 @@ batch path uses). Supported column types:
 | `date` | `date32` (Unix epoch) |
 | `timestamp` | `timestamp[us]` (naive) |
 | `timestamptz` | `timestamp[us, tz=UTC]` |
-| `numeric(p,s)` | `decimal128(p,s)` - see below |
+| `numeric(p,s)` | `decimal32(p,s)` / `decimal64(p,s)` / `decimal128(p,s)` - see below |
 | `numeric` (unconstrained) | `utf8` - see below |
 
 ### NUMERIC: the one place this differs from pg_zerialize
 
-Arrow has a real fixed-point decimal type (`decimal128`) that PostgreSQL's
-`NUMERIC` actually maps to precisely - pg_zerialize's own formats don't
-have an equivalent, so it converts NUMERIC to float8 or text. `pg_arrow`
-does better where it can:
+Arrow has real fixed-point decimal types (`decimal32`/`decimal64`/`decimal128`)
+that PostgreSQL's `NUMERIC` actually maps to precisely - pg_zerialize's own
+formats don't have an equivalent, so it converts NUMERIC to float8 or text.
+`pg_arrow` does better where it can:
 
-- **`numeric(p,s)`** (a declared precision/scale): mapped exactly to
-  `decimal128(p, s)`. Lossless.
+- **`numeric(p,s)`** (a declared precision/scale): mapped exactly to the
+  NARROWEST decimal width that can represent the declared precision `p` -
+  `decimal32(p,s)` for `p<=9`, `decimal64(p,s)` for `p<=18`, else
+  `decimal128(p,s)` for `p<=38`. Lossless either way; the width choice only
+  affects the wire size, not the value. (`decimal256` is never emitted -
+  Arrow's own `decimal128` already covers PostgreSQL NUMERIC's full declarable
+  range, `p<=38`, so there's no PostgreSQL source value that would ever need
+  it.)
 - **Unconstrained `numeric`** (no declared precision/scale, `typmod ==
-  -1`): different rows can have arbitrary/differing scale, but Arrow's
-  `decimal128` needs one fixed `(precision, scale)` for the whole column.
+  -1`): different rows can have arbitrary/differing scale, but any fixed
+  Arrow decimal type needs one `(precision, scale)` for the whole column.
   There's no single fixed decimal type guaranteed to fit every row
   losslessly, so this falls back to a `utf8` column carrying the exact
   `numeric_out()` text - lossless, but **not** a decimal type. If you need
-  a real `decimal128` column, declare the source column's precision/scale
+  a real decimal column, declare the source column's precision/scale
   explicitly.
-- A declared `numeric(p,s)` outside what `decimal128` can represent
-  (`p > 38`, or `s < 0` - PostgreSQL 15+ allows negative-scale NUMERIC)
-  also falls back to the same `utf8` text path.
+- A declared `numeric(p,s)` outside what `decimal128` (the widest of the
+  three) can represent (`p > 38`, or `s < 0` - PostgreSQL 15+ allows
+  negative-scale NUMERIC) also falls back to the same `utf8` text path.
 
 ### Dates and timestamps: Unix epoch, not PostgreSQL's
 

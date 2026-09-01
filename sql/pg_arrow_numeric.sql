@@ -15,6 +15,34 @@ SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
 
 DROP TYPE pgarrow_decimal_row;
 
+-- Narrow NUMERIC(p,s) with p<=9 -> Decimal32(p,s), not Decimal128 - the
+-- narrowest width that fits the declared precision, chosen at the schema
+-- level (not per row).
+CREATE TYPE pgarrow_decimal32_row AS (qty numeric(6,2));
+
+SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
+    ROW(123.45)::pgarrow_decimal32_row,
+    ROW(9999.99)::pgarrow_decimal32_row,
+    ROW(-1.50)::pgarrow_decimal32_row,
+    ROW(NULL)::pgarrow_decimal32_row
+])) = jsonb_build_object('qty', jsonb_build_array(123.45, 9999.99, -1.50, NULL))
+    AS decimal32_exact_roundtrip;
+
+DROP TYPE pgarrow_decimal32_row;
+
+-- NUMERIC(p,s) with 9<p<=18 -> Decimal64(p,s), not Decimal128.
+CREATE TYPE pgarrow_decimal64_row AS (amount numeric(15,4));
+
+SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
+    ROW(123456789.4500)::pgarrow_decimal64_row,
+    ROW(99999999999.9999)::pgarrow_decimal64_row,
+    ROW(-42.1)::pgarrow_decimal64_row,
+    ROW(NULL)::pgarrow_decimal64_row
+])) = jsonb_build_object('amount', jsonb_build_array(123456789.4500, 99999999999.9999, -42.1000, NULL))
+    AS decimal64_exact_roundtrip;
+
+DROP TYPE pgarrow_decimal64_row;
+
 -- Unconstrained NUMERIC (typmod == -1) -> Utf8 text fallback, exact
 -- numeric_out() text, not a fixed decimal - values here deliberately have
 -- different scales, which a single fixed Decimal128(p,s) for the whole
