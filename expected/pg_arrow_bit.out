@@ -1,0 +1,82 @@
+SET client_min_messages TO warning;
+DROP EXTENSION IF EXISTS pg_arrow CASCADE;
+CREATE EXTENSION pg_arrow;
+-- BIT(8) -> exact Arrow uint8. B'10000001' = 0x81 = 129, not a signed -127 - the concrete case
+-- that would catch a signed/unsigned mixup on the narrowest width.
+CREATE TYPE pgarrow_bit8_row AS (v bit(8));
+SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
+    ROW(B'10000001')::pgarrow_bit8_row,
+    ROW(B'00000000')::pgarrow_bit8_row,
+    ROW(B'11111111')::pgarrow_bit8_row,
+    ROW(NULL)::pgarrow_bit8_row
+])) = jsonb_build_object('v', jsonb_build_array(129, 0, 255, NULL))
+    AS bit8_exact_roundtrip;
+ bit8_exact_roundtrip 
+----------------------
+ t
+(1 row)
+
+DROP TYPE pgarrow_bit8_row;
+-- BIT(16) -> exact Arrow uint16. Most-significant-bit-first storage confirmed both ways: the
+-- leading bit is the MOST significant (32768), the trailing bit is the LEAST significant (1).
+CREATE TYPE pgarrow_bit16_row AS (v bit(16));
+SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
+    ROW(B'1000000000000000')::pgarrow_bit16_row,
+    ROW(B'0000000000000001')::pgarrow_bit16_row,
+    ROW(B'1111111111111111')::pgarrow_bit16_row,
+    ROW(NULL)::pgarrow_bit16_row
+])) = jsonb_build_object('v', jsonb_build_array(32768, 1, 65535, NULL))
+    AS bit16_exact_roundtrip;
+ bit16_exact_roundtrip 
+-----------------------
+ t
+(1 row)
+
+DROP TYPE pgarrow_bit16_row;
+-- BIT(32) -> exact Arrow uint32.
+CREATE TYPE pgarrow_bit32_row AS (v bit(32));
+SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
+    ROW(B'10000000000000000000000000000000'::bit(32))::pgarrow_bit32_row,
+    ROW(B'00000000000000000000000000000001')::pgarrow_bit32_row,
+    ROW(X'FFFFFFFF'::bit(32))::pgarrow_bit32_row,
+    ROW(NULL)::pgarrow_bit32_row
+])) = jsonb_build_object('v', jsonb_build_array(2147483648, 1, 4294967295, NULL))
+    AS bit32_exact_roundtrip;
+ bit32_exact_roundtrip 
+-----------------------
+ t
+(1 row)
+
+DROP TYPE pgarrow_bit32_row;
+-- BIT(64) -> exact Arrow uint64. The all-ones case is the one that would silently come back
+-- negative (-1) if this ever got treated as signed anywhere in the pipeline instead of unsigned.
+CREATE TYPE pgarrow_bit64_row AS (v bit(64));
+SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
+    ROW(X'8000000000000000'::bit(64))::pgarrow_bit64_row,
+    ROW(X'0000000000000001'::bit(64))::pgarrow_bit64_row,
+    ROW(X'FFFFFFFFFFFFFFFF'::bit(64))::pgarrow_bit64_row,
+    ROW(NULL)::pgarrow_bit64_row
+])) = jsonb_build_object('v', jsonb_build_array(9223372036854775808, 1, 18446744073709551615, NULL))
+    AS bit64_exact_roundtrip;
+ bit64_exact_roundtrip 
+-----------------------
+ t
+(1 row)
+
+DROP TYPE pgarrow_bit64_row;
+-- BIT(n) for n outside {8,16,32,64} - no clean fixed-width Arrow integer target, falls back to
+-- the existing Unsupported rejection path (same one an unhandled type always hits).
+CREATE TYPE pgarrow_bit12_row AS (v bit(12));
+SELECT rows_to_arrow(ARRAY[ROW(B'000000000001')::pgarrow_bit12_row]);
+ERROR:  rows_to_arrow does not support this row's column types
+DETAIL:  Unsupported column(s): v. Only flat scalar columns are supported (no nested composite, array, uuid, json/jsonb, enum, or network-address columns).
+DROP TYPE pgarrow_bit12_row;
+-- BIT VARYING - deliberately never mapped (its length is a maximum, not an actual per-row
+-- length), regardless of the declared max length - stays Unsupported even at a byte-multiple
+-- max like 8.
+CREATE TYPE pgarrow_bitvarying_row AS (v bit varying(8));
+SELECT rows_to_arrow(ARRAY[ROW(B'00000001')::pgarrow_bitvarying_row]);
+ERROR:  rows_to_arrow does not support this row's column types
+DETAIL:  Unsupported column(s): v. Only flat scalar columns are supported (no nested composite, array, uuid, json/jsonb, enum, or network-address columns).
+DROP TYPE pgarrow_bitvarying_row;
+DROP EXTENSION pg_arrow;

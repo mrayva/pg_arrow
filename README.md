@@ -69,6 +69,7 @@ batch path uses). Supported column types:
 | `timestamptz` | `timestamp[us, tz=UTC]` |
 | `numeric(p,s)` | `decimal32(p,s)` / `decimal64(p,s)` / `decimal128(p,s)` / `decimal256(p,s)` - see below |
 | `numeric` (unconstrained) | `utf8` - see below |
+| `bit(8)` / `bit(16)` / `bit(32)` / `bit(64)` | `uint8` / `uint16` / `uint32` / `uint64` - see below |
 
 ### NUMERIC: the one place this differs from pg_zerialize
 
@@ -97,6 +98,28 @@ formats don't have an equivalent, so it converts NUMERIC to float8 or text.
   `(76, 1000]` is a real, deliberately-unclosed gap - `decimal256` covers
   the vast majority of practical schemas, and closing the rest would need
   an arbitrary-precision decimal type Arrow doesn't have.
+
+### BIT(n): only the four whole-byte widths
+
+`BIT(8)/BIT(16)/BIT(32)/BIT(64)` map exactly to Arrow's native unsigned integer types
+(`uint8`/`uint16`/`uint32`/`uint64`) - these are the only four `BIT(n)` lengths where the bit
+string packs into a whole number of bytes with no partial-byte padding, so the byte-to-integer
+mapping is exact and unambiguous. PostgreSQL stores a bit string's bytes most-significant-byte
+first; `pg_arrow` converts to Arrow's host-native byte order internally (`arrow::bit_util::
+FromBigEndian`) - the value round-trips exactly, including the all-ones case (`bit(64)`'s
+`X'FFFFFFFFFFFFFFFF'` decodes as `18446744073709551615`, not a negative number).
+
+Any other `BIT(n)` length (e.g. `bit(12)`, or plain `bit` which is `bit(1)`) has no clean
+fixed-width Arrow integer target and falls back to the same `Unsupported`-column rejection any
+other unhandled type hits. `BIT VARYING` is never mapped either, regardless of its declared
+maximum length (even a byte-multiple one like `bit varying(8)`) - its declared length is a
+*maximum*, not each row's actual length, which is a real, separate problem this doesn't attempt
+to solve.
+
+`char(1)` was also considered as an Arrow `uint8` and deliberately rejected: unlike `BIT(n)`,
+`char(1)` is defined in *characters*, not bytes - under PostgreSQL's usual `UTF8` server encoding
+a "1-character" value can be 1-4 bytes, so there's no safe, general byte-to-integer mapping the
+way there is for a bit string.
 
 ### Dates and timestamps: Unix epoch, not PostgreSQL's
 

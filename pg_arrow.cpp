@@ -32,6 +32,7 @@ extern "C" {
 #include "utils/jsonb.h"
 #include "utils/fmgrprotos.h"
 #include "utils/timestamp.h"
+#include "utils/varbit.h"
 #include "access/htup_details.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
@@ -66,6 +67,7 @@ PG_FUNCTION_INFO_V1(arrow_to_jsonb);
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
+#include <arrow/util/endian.h>
 
 #include <vector>
 #include <string>
@@ -116,6 +118,18 @@ enum class ArrowKind {
     // lossless, unlike forcing a fixed decimal that might not fit every row.
     // See README for why.
     NumericText,
+    // BIT(n) for n in {8,16,32,64} - the widths where a fixed-length bit string packs into a
+    // whole number of bytes with no partial-byte padding (VarBit's own padding rule: only the
+    // LAST byte can be partially used, and BIT(n) at these four widths never has one). Postgres
+    // stores the bytes most-significant-byte first (utils/varbit.h's own doc comment, confirmed
+    // independently against a live instance: B'1000000000000000'::bit(16)::int4 = 32768) -
+    // append_value() converts via arrow::bit_util::FromBigEndian. Any other BIT(n) length, and
+    // BIT VARYING entirely (its length is a maximum, not an actual per-row length - a real,
+    // separate design problem), stay Unsupported. See README for the full rationale.
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
     Date32,
     // Both TIMESTAMP and TIMESTAMPTZ map here: both are stored internally
     // as int64 microseconds since the Postgres epoch (2000-01-01). Only the
@@ -259,6 +273,19 @@ static ArrowKind classify_column(Oid typid, int32 typmod, int32_t* out_precision
             }
             return ArrowKind::Decimal256;
         }
+        case BITOID:
+            // typmod is the bit count directly for BIT(n) - not packed like NUMERIC's
+            // precision/scale (verified against a live instance: bit(8)/16/32/64 -> atttypmod
+            // 8/16/32/64 exactly). No VARBITOID (BIT VARYING) case here at all - its length is a
+            // maximum, not an actual per-row length, so it falls to Unsupported below like any
+            // other unhandled type, same as any other BIT(n) width.
+            switch (typmod) {
+                case 8:  return ArrowKind::UInt8;
+                case 16: return ArrowKind::UInt16;
+                case 32: return ArrowKind::UInt32;
+                case 64: return ArrowKind::UInt64;
+                default: return ArrowKind::Unsupported;
+            }
         default:
             return ArrowKind::Unsupported;
     }
@@ -280,6 +307,10 @@ static std::shared_ptr<arrow::DataType> build_arrow_type(const CachedColumn& col
         case ArrowKind::Decimal64: return arrow::decimal64(col.decimal_precision, col.decimal_scale);
         case ArrowKind::Decimal128: return arrow::decimal128(col.decimal_precision, col.decimal_scale);
         case ArrowKind::Decimal256: return arrow::decimal256(col.decimal_precision, col.decimal_scale);
+        case ArrowKind::UInt8: return arrow::uint8();
+        case ArrowKind::UInt16: return arrow::uint16();
+        case ArrowKind::UInt32: return arrow::uint32();
+        case ArrowKind::UInt64: return arrow::uint64();
         case ArrowKind::Date32: return arrow::date32();
         case ArrowKind::TimestampMicros: return arrow::timestamp(arrow::TimeUnit::MICRO);
         case ArrowKind::TimestampMicrosTz: return arrow::timestamp(arrow::TimeUnit::MICRO, "UTC");
@@ -496,6 +527,41 @@ static void append_value(arrow::ArrayBuilder* builder, const CachedColumn& col, 
                 arrow::Decimal256 dec;
                 decimalN_from_numeric(value, col.decimal_precision, col.decimal_scale, &dec);
                 status = static_cast<arrow::Decimal256Builder*>(builder)->Append(dec);
+                break;
+            }
+            // classify_column() only ever picks these four kinds when the column's own typmod
+            // (bit count) exactly matches the width, so VARBITBYTES(vb) below is guaranteed to
+            // equal sizeof(the target type) - trusted from that column-level classification, not
+            // re-validated per row (same convention decimal precision/scale already relies on).
+            case ArrowKind::UInt8: {
+                VarBit* vb = DatumGetVarBitP(value);
+                uint8_t raw;
+                std::memcpy(&raw, VARBITS(vb), sizeof(raw)); // single byte - no endian conversion
+                status = static_cast<arrow::UInt8Builder*>(builder)->Append(raw);
+                break;
+            }
+            case ArrowKind::UInt16: {
+                VarBit* vb = DatumGetVarBitP(value);
+                uint16_t raw;
+                std::memcpy(&raw, VARBITS(vb), sizeof(raw));
+                status = static_cast<arrow::UInt16Builder*>(builder)->Append(
+                    arrow::bit_util::FromBigEndian(raw));
+                break;
+            }
+            case ArrowKind::UInt32: {
+                VarBit* vb = DatumGetVarBitP(value);
+                uint32_t raw;
+                std::memcpy(&raw, VARBITS(vb), sizeof(raw));
+                status = static_cast<arrow::UInt32Builder*>(builder)->Append(
+                    arrow::bit_util::FromBigEndian(raw));
+                break;
+            }
+            case ArrowKind::UInt64: {
+                VarBit* vb = DatumGetVarBitP(value);
+                uint64_t raw;
+                std::memcpy(&raw, VARBITS(vb), sizeof(raw));
+                status = static_cast<arrow::UInt64Builder*>(builder)->Append(
+                    arrow::bit_util::FromBigEndian(raw));
                 break;
             }
             case ArrowKind::Date32: {
@@ -805,6 +871,32 @@ static JsonbValue* array_column_to_jsonb(const std::shared_ptr<arrow::Array>& ar
             }
             case arrow::Type::DECIMAL256: {
                 auto text_val = static_cast<const arrow::Decimal256Array&>(*array).FormatValue(i);
+                jv.type = jbvNumeric;
+                jv.val.numeric = DatumGetNumeric(DirectFunctionCall3(
+                    numeric_in, CStringGetDatum(text_val.c_str()), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));
+                break;
+            }
+            case arrow::Type::UINT8:
+                jv.type = jbvNumeric;
+                jv.val.numeric = int64_to_numeric(
+                    static_cast<int64_t>(static_cast<const arrow::UInt8Array&>(*array).Value(i)));
+                break;
+            case arrow::Type::UINT16:
+                jv.type = jbvNumeric;
+                jv.val.numeric = int64_to_numeric(
+                    static_cast<int64_t>(static_cast<const arrow::UInt16Array&>(*array).Value(i)));
+                break;
+            case arrow::Type::UINT32:
+                jv.type = jbvNumeric;
+                jv.val.numeric = int64_to_numeric(
+                    static_cast<int64_t>(static_cast<const arrow::UInt32Array&>(*array).Value(i)));
+                break;
+            case arrow::Type::UINT64: {
+                // Unlike UINT8/16/32, a uint64 value can exceed int64_to_numeric()'s signed
+                // domain (its own top half, 2^63 to 2^64-1) - go through text + numeric_in()
+                // instead, the same round trip the DECIMAL32/64/128/256 cases above already use.
+                uint64_t v = static_cast<const arrow::UInt64Array&>(*array).Value(i);
+                std::string text_val = std::to_string(v);
                 jv.type = jbvNumeric;
                 jv.val.numeric = DatumGetNumeric(DirectFunctionCall3(
                     numeric_in, CStringGetDatum(text_val.c_str()), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));

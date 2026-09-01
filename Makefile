@@ -5,7 +5,7 @@ OBJS = pg_arrow.o
 
 EXTENSION = pg_arrow
 DATA = pg_arrow--1.0.sql
-REGRESS = pg_arrow pg_arrow_numeric pg_arrow_errors
+REGRESS = pg_arrow pg_arrow_numeric pg_arrow_bit pg_arrow_errors
 
 # libarrow comes from the system package (libarrow-dev, apt.arrow.apache.org)
 # rather than being vendored the way pg_zerialize vendors glaze/jsoncons -
