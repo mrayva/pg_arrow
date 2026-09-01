@@ -2,7 +2,9 @@ SET client_min_messages TO warning;
 DROP EXTENSION IF EXISTS pg_arrow CASCADE;
 CREATE EXTENSION pg_arrow;
 
--- Constrained NUMERIC(p,s) -> exact Arrow Decimal128(p,s).
+-- Constrained NUMERIC(p,s) -> exact Arrow decimal, width chosen by precision
+-- (p=12 here is <=18, so this is actually Decimal64 under the narrowest-fit
+-- rule below - kept as the general round-trip sanity check it always was).
 CREATE TYPE pgarrow_decimal_row AS (price numeric(12,4));
 
 SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
@@ -42,6 +44,52 @@ SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
     AS decimal64_exact_roundtrip;
 
 DROP TYPE pgarrow_decimal64_row;
+
+-- NUMERIC(p,s) with 18<p<=38 -> Decimal128(p,s), not Decimal64/Decimal256.
+CREATE TYPE pgarrow_decimal128_row AS (total numeric(30,6));
+
+SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
+    ROW(123456789012345.450000)::pgarrow_decimal128_row,
+    ROW(999999999999999999999999.999999)::pgarrow_decimal128_row,
+    ROW(-42.1)::pgarrow_decimal128_row,
+    ROW(NULL)::pgarrow_decimal128_row
+])) = jsonb_build_object('total', jsonb_build_array(
+        123456789012345.450000, 999999999999999999999999.999999, -42.100000, NULL))
+    AS decimal128_exact_roundtrip;
+
+DROP TYPE pgarrow_decimal128_row;
+
+-- NUMERIC(p,s) with 38<p<=76 -> Decimal256(p,s), the widest fixed decimal
+-- width this extension emits - exercises a value beyond Decimal128's own
+-- 38-digit ceiling (double can only represent ~15-17 significant digits
+-- exactly, so this specifically checks precision a lossy double would lose).
+CREATE TYPE pgarrow_decimal256_row AS (huge numeric(50,10));
+
+SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
+    ROW(123456789012345678901234567890.1234567890)::pgarrow_decimal256_row,
+    ROW(99999999999999999999999999999999999999.9999999999)::pgarrow_decimal256_row,
+    ROW(-42.1)::pgarrow_decimal256_row,
+    ROW(NULL)::pgarrow_decimal256_row
+])) = jsonb_build_object('huge', jsonb_build_array(
+        123456789012345678901234567890.1234567890,
+        99999999999999999999999999999999999999.9999999999,
+        -42.1000000000, NULL))
+    AS decimal256_exact_roundtrip;
+
+DROP TYPE pgarrow_decimal256_row;
+
+-- NUMERIC(p,s) with p>76 -> Utf8 text fallback (same reasoning as
+-- unconstrained: no fixed Arrow decimal width, including Decimal256, can
+-- represent it).
+CREATE TYPE pgarrow_over_decimal256_row AS (v numeric(80,2));
+
+SELECT arrow_to_jsonb(rows_to_arrow(ARRAY[
+    ROW(1.50)::pgarrow_over_decimal256_row,
+    ROW(NULL)::pgarrow_over_decimal256_row
+])) = jsonb_build_object('v', jsonb_build_array('1.50', NULL))
+    AS over_decimal256_precision_text_fallback;
+
+DROP TYPE pgarrow_over_decimal256_row;
 
 -- Unconstrained NUMERIC (typmod == -1) -> Utf8 text fallback, exact
 -- numeric_out() text, not a fixed decimal - values here deliberately have

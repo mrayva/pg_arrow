@@ -93,25 +93,28 @@ enum class ArrowKind {
     Boolean,
     Utf8,
     Binary,
-    // A constrained NUMERIC(p,s) maps to the NARROWEST of these three that can
+    // A constrained NUMERIC(p,s) maps to the NARROWEST of these four that can
     // represent its declared precision (Decimal32: p<=9, Decimal64: p<=18,
-    // Decimal128: p<=38) - not always Decimal128 regardless of how small p
-    // actually is. Picking the narrowest fitting width matters downstream:
-    // nats_sidecar's own Arrow reader only recognizes Decimal32/64/128 (not
-    // 256), so a table declaring e.g. numeric(4,2) is what makes that reader's
-    // decimal32 path reachable at all from a real Postgres source - see its
-    // own arrow_columnar_rows.hpp for why decimal256 is deliberately still
-    // unsupported there.
+    // Decimal128: p<=38, Decimal256: p<=76) - not always the widest regardless
+    // of how small p actually is. Picking the narrowest fitting width matters
+    // downstream: nats_sidecar's own Arrow reader natively supports all four
+    // widths (widened internally to its own Int256), so a table declaring
+    // e.g. numeric(4,2) is what makes that reader's decimal32 path reachable
+    // at all from a real Postgres source.
     Decimal32,
     Decimal64,
     Decimal128,
+    Decimal256,
     // A NUMERIC column that can't map to a fixed DecimalN(precision,scale)
     // for the whole column - either unconstrained (typmod == -1, so
     // different rows may have different scales) or the typmod's declared
-    // precision/scale falls outside what Decimal128 (the widest of the three
-    // above) can represent (precision > 38 or scale < 0). Falls back to the
-    // exact numeric_out() text, as a Utf8 column - lossless, unlike forcing a
-    // fixed decimal that might not fit every row. See README for why.
+    // precision/scale falls outside what Decimal256 (the widest of the four
+    // above) can represent (precision > 76 or scale < 0). Postgres itself
+    // allows NUMERIC precision up to 1000, so a very wide declared column
+    // still falls back here even though Decimal256 covers most real-world
+    // cases. Falls back to the exact numeric_out() text, as a Utf8 column -
+    // lossless, unlike forcing a fixed decimal that might not fit every row.
+    // See README for why.
     NumericText,
     Date32,
     // Both TIMESTAMP and TIMESTAMPTZ map here: both are stored internally
@@ -151,7 +154,7 @@ struct CachedColumn {
     Oid typid;
     int32 typmod;
     ArrowKind kind;
-    // Only meaningful when kind == Decimal128.
+    // Only meaningful when kind is one of Decimal32/64/128/256.
     int32_t decimal_precision;
     int32_t decimal_scale;
     std::shared_ptr<arrow::Field> field;
@@ -225,19 +228,23 @@ static ArrowKind classify_column(Oid typid, int32 typmod, int32_t* out_precision
             }
             int32_t precision, scale;
             decode_numeric_typmod(typmod, &precision, &scale);
-            // Decimal128 (the widest of the three we emit) supports precision
-            // in [1,38] and requires scale >= 0 (Postgres 15+ allows
-            // NUMERIC(p, negative_scale), which none of Decimal32/64/128 can
-            // represent) - fall back to text for anything outside that range,
-            // same reasoning as unconstrained.
-            if (precision < 1 || precision > 38 || scale < 0 || scale > precision) {
+            // Decimal256 (the widest of the four we emit) supports precision
+            // in [1,76] and requires scale >= 0 (Postgres 15+ allows
+            // NUMERIC(p, negative_scale), which none of Decimal32/64/128/256
+            // can represent) - fall back to text for anything outside that
+            // range, same reasoning as unconstrained. Postgres itself allows
+            // precision up to 1000, so precision in (76,1000] still falls
+            // back here too - a known, deliberately-unclosed gap (see
+            // NumericText's own comment).
+            if (precision < 1 || precision > 76 || scale < 0 || scale > precision) {
                 return ArrowKind::NumericText;
             }
             *out_precision = precision;
             *out_scale = scale;
             // Narrowest decimal width that fits the DECLARED precision, not
-            // always Decimal128 - matches Arrow's own kMaxPrecision per width
-            // (Decimal32Type::kMaxPrecision=9, Decimal64Type::kMaxPrecision=18).
+            // always the widest - matches Arrow's own kMaxPrecision per width
+            // (Decimal32Type::kMaxPrecision=9, Decimal64Type::kMaxPrecision=18,
+            // Decimal128Type::kMaxPrecision=38, Decimal256Type::kMaxPrecision=76).
             // A value that's individually smaller than its column's declared
             // precision still gets the column's own (wider) width - width is a
             // schema-level property of the whole column, not chosen per row.
@@ -247,7 +254,10 @@ static ArrowKind classify_column(Oid typid, int32 typmod, int32_t* out_precision
             if (precision <= arrow::Decimal64Type::kMaxPrecision) {
                 return ArrowKind::Decimal64;
             }
-            return ArrowKind::Decimal128;
+            if (precision <= arrow::Decimal128Type::kMaxPrecision) {
+                return ArrowKind::Decimal128;
+            }
+            return ArrowKind::Decimal256;
         }
         default:
             return ArrowKind::Unsupported;
@@ -269,6 +279,7 @@ static std::shared_ptr<arrow::DataType> build_arrow_type(const CachedColumn& col
         case ArrowKind::Decimal32: return arrow::decimal32(col.decimal_precision, col.decimal_scale);
         case ArrowKind::Decimal64: return arrow::decimal64(col.decimal_precision, col.decimal_scale);
         case ArrowKind::Decimal128: return arrow::decimal128(col.decimal_precision, col.decimal_scale);
+        case ArrowKind::Decimal256: return arrow::decimal256(col.decimal_precision, col.decimal_scale);
         case ArrowKind::Date32: return arrow::date32();
         case ArrowKind::TimestampMicros: return arrow::timestamp(arrow::TimeUnit::MICRO);
         case ArrowKind::TimestampMicrosTz: return arrow::timestamp(arrow::TimeUnit::MICRO, "UTC");
@@ -390,10 +401,10 @@ static const CachedSchema* columnar_batch_schema(Datum* elements, bool* nulls, i
 static constexpr int64_t kPgToUnixEpochDays = POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE;
 static constexpr int64_t kPgToUnixEpochMicros = kPgToUnixEpochDays * 86400LL * 1000000LL;
 
-// Decimal32/Decimal64/Decimal128 all expose the identical FromString(text, &out, &precision,
-// &scale)/Rescale(from, to) shape (confirmed directly against arrow/util/decimal.h before
-// templating this - not assumed from Decimal128's own API alone), so one function serves all
-// three DecimalN widths append_value() actually emits, instead of near-duplicate copies.
+// Decimal32/Decimal64/Decimal128/Decimal256 all expose the identical FromString(text, &out,
+// &precision, &scale)/Rescale(from, to) shape (confirmed directly against arrow/util/decimal.h
+// before templating this - not assumed from Decimal128's own API alone), so one function serves
+// all four DecimalN widths append_value() actually emits, instead of near-duplicate copies.
 template <typename DecimalT>
 static void decimalN_from_numeric(Datum value, int32_t target_precision, int32_t target_scale,
                                    DecimalT* out)
@@ -479,6 +490,12 @@ static void append_value(arrow::ArrayBuilder* builder, const CachedColumn& col, 
                 arrow::Decimal128 dec;
                 decimalN_from_numeric(value, col.decimal_precision, col.decimal_scale, &dec);
                 status = static_cast<arrow::Decimal128Builder*>(builder)->Append(dec);
+                break;
+            }
+            case ArrowKind::Decimal256: {
+                arrow::Decimal256 dec;
+                decimalN_from_numeric(value, col.decimal_precision, col.decimal_scale, &dec);
+                status = static_cast<arrow::Decimal256Builder*>(builder)->Append(dec);
                 break;
             }
             case ArrowKind::Date32: {
@@ -781,6 +798,13 @@ static JsonbValue* array_column_to_jsonb(const std::shared_ptr<arrow::Array>& ar
             }
             case arrow::Type::DECIMAL128: {
                 auto text_val = static_cast<const arrow::Decimal128Array&>(*array).FormatValue(i);
+                jv.type = jbvNumeric;
+                jv.val.numeric = DatumGetNumeric(DirectFunctionCall3(
+                    numeric_in, CStringGetDatum(text_val.c_str()), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));
+                break;
+            }
+            case arrow::Type::DECIMAL256: {
+                auto text_val = static_cast<const arrow::Decimal256Array&>(*array).FormatValue(i);
                 jv.type = jbvNumeric;
                 jv.val.numeric = DatumGetNumeric(DirectFunctionCall3(
                     numeric_in, CStringGetDatum(text_val.c_str()), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));

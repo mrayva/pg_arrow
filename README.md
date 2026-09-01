@@ -67,24 +67,21 @@ batch path uses). Supported column types:
 | `date` | `date32` (Unix epoch) |
 | `timestamp` | `timestamp[us]` (naive) |
 | `timestamptz` | `timestamp[us, tz=UTC]` |
-| `numeric(p,s)` | `decimal32(p,s)` / `decimal64(p,s)` / `decimal128(p,s)` - see below |
+| `numeric(p,s)` | `decimal32(p,s)` / `decimal64(p,s)` / `decimal128(p,s)` / `decimal256(p,s)` - see below |
 | `numeric` (unconstrained) | `utf8` - see below |
 
 ### NUMERIC: the one place this differs from pg_zerialize
 
-Arrow has real fixed-point decimal types (`decimal32`/`decimal64`/`decimal128`)
+Arrow has real fixed-point decimal types (`decimal32`/`decimal64`/`decimal128`/`decimal256`)
 that PostgreSQL's `NUMERIC` actually maps to precisely - pg_zerialize's own
 formats don't have an equivalent, so it converts NUMERIC to float8 or text.
 `pg_arrow` does better where it can:
 
 - **`numeric(p,s)`** (a declared precision/scale): mapped exactly to the
   NARROWEST decimal width that can represent the declared precision `p` -
-  `decimal32(p,s)` for `p<=9`, `decimal64(p,s)` for `p<=18`, else
-  `decimal128(p,s)` for `p<=38`. Lossless either way; the width choice only
-  affects the wire size, not the value. (`decimal256` is never emitted -
-  Arrow's own `decimal128` already covers PostgreSQL NUMERIC's full declarable
-  range, `p<=38`, so there's no PostgreSQL source value that would ever need
-  it.)
+  `decimal32(p,s)` for `p<=9`, `decimal64(p,s)` for `p<=18`, `decimal128(p,s)`
+  for `p<=38`, else `decimal256(p,s)` for `p<=76`. Lossless either way; the
+  width choice only affects the wire size, not the value.
 - **Unconstrained `numeric`** (no declared precision/scale, `typmod ==
   -1`): different rows can have arbitrary/differing scale, but any fixed
   Arrow decimal type needs one `(precision, scale)` for the whole column.
@@ -93,9 +90,13 @@ formats don't have an equivalent, so it converts NUMERIC to float8 or text.
   `numeric_out()` text - lossless, but **not** a decimal type. If you need
   a real decimal column, declare the source column's precision/scale
   explicitly.
-- A declared `numeric(p,s)` outside what `decimal128` (the widest of the
-  three) can represent (`p > 38`, or `s < 0` - PostgreSQL 15+ allows
+- A declared `numeric(p,s)` outside what `decimal256` (the widest of the
+  four) can represent (`p > 76`, or `s < 0` - PostgreSQL 15+ allows
   negative-scale NUMERIC) also falls back to the same `utf8` text path.
+  PostgreSQL itself allows a declared precision up to 1000, so `p` in
+  `(76, 1000]` is a real, deliberately-unclosed gap - `decimal256` covers
+  the vast majority of practical schemas, and closing the rest would need
+  an arbitrary-precision decimal type Arrow doesn't have.
 
 ### Dates and timestamps: Unix epoch, not PostgreSQL's
 

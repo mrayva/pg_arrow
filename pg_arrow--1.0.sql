@@ -10,7 +10,7 @@ AS 'MODULE_PATHNAME', 'rows_to_arrow'
 LANGUAGE C STABLE STRICT;
 
 COMMENT ON FUNCTION rows_to_arrow(anyarray) IS
-'Encode an array of PostgreSQL rows/records into a single Apache Arrow IPC stream (one RecordBatch). Requires a homogeneous, flat scalar composite type across all non-null elements. NUMERIC columns with a declared precision/scale map to Arrow Decimal128 exactly; unconstrained NUMERIC columns fall back to a Utf8 column of exact numeric_out() text.';
+'Encode an array of PostgreSQL rows/records into a single Apache Arrow IPC stream (one RecordBatch). Requires a homogeneous, flat scalar composite type across all non-null elements. NUMERIC columns with a declared precision/scale map exactly to the narrowest Arrow decimal width that fits (Decimal32/64/128/256); unconstrained or overly-wide NUMERIC columns fall back to a Utf8 column of exact numeric_out() text.';
 
 CREATE OR REPLACE FUNCTION arrow_to_jsonb(bytea)
 RETURNS jsonb
